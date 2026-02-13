@@ -7,16 +7,17 @@ import cv2
 from datetime import datetime
 from pyzbar.pyzbar import decode, ZBarSymbol
 
-# ---------------- CONFIG & DB ----------------
+# --- CONFIGURATION ---
 st.set_page_config(page_title="QR Attendance System", layout="wide")
 QR_FOLDER = "qr_codes"
 DB_NAME = "attendance.db"
 os.makedirs(QR_FOLDER, exist_ok=True)
 
+# --- DATABASE LOGIC ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Create attendance table
+    # Table for final attendance logs
     c.execute("""
         CREATE TABLE IF NOT EXISTS attendance(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,7 +28,7 @@ def init_db():
             scan_time TEXT
         )
     """)
-    # Create student_registry table to store info from Excel
+    # Table for registered students (from Excel)
     c.execute("""
         CREATE TABLE IF NOT EXISTS students(
             student_id TEXT PRIMARY KEY,
@@ -40,104 +41,95 @@ def init_db():
 
 init_db()
 
-# ---------------- HELPER FUNCTIONS ----------------
-def save_to_db(student_id, name, mobile, status):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO attendance(student_id, name, mobile, status, scan_time) VALUES(?,?,?,?,?)",
-              (student_id, name, mobile, status, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
+# --- APP TABS ---
+tab1, tab2, tab3 = st.tabs(["📤 Register & QR", "📷 Scan Attendance", "📊 View Records"])
 
-def generate_qr(data, file_name):
-    img = qrcode.make(data)
-    path = os.path.join(QR_FOLDER, file_name)
-    img.save(path)
-    return path
-
-# ---------------- SIDEBAR ----------------
-menu = st.sidebar.radio("Menu", ["Upload & Register", "Scan QR", "Records"])
-
-# ---------------- PAGE 1: UPLOAD & REGISTER ----------------
-if menu == "Upload & Register":
-    st.title("📤 Register Students & Generate QR")
-    file = st.file_uploader("Upload Student Excel", type=["xlsx"])
+# --- TAB 1: UPLOAD EXCEL ---
+with tab1:
+    st.title("Student Registration")
+    uploaded_file = st.file_uploader("Upload Student List (Excel)", type=["xlsx"])
     
-    if file:
-        df = pd.read_excel(file)
-        st.dataframe(df)
+    if uploaded_file:
+        df = pd.read_excel(uploaded_file)
+        st.write("Preview of Data:", df.head())
         
-        if st.button("Generate QR & Save to Database"):
+        if st.button("Register Students & Create QRs"):
             conn = sqlite3.connect(DB_NAME)
-            qr_paths = []
             for _, row in df.iterrows():
                 sid, name, mob = str(row["Student ID"]), str(row["Name"]), str(row["Mobile"])
                 
-                # Save to student registry
+                # 1. Save to Database
                 conn.execute("INSERT OR REPLACE INTO students (student_id, name, mobile) VALUES (?,?,?)", (sid, name, mob))
                 
-                # Generate QR
+                # 2. Generate QR
                 qr_text = f"{sid}|{name}|{mob}"
-                path = generate_qr(qr_text, f"{sid}.png")
-                qr_paths.append(path)
-            
+                img = qrcode.make(qr_text)
+                img.save(os.path.join(QR_FOLDER, f"{sid}.png"))
+                
             conn.commit()
             conn.close()
-            st.success("Registration Complete & QR Codes Generated!")
+            st.success(f"✅ Registered {len(df)} students and generated QR codes!")
 
-# ---------------- PAGE 2: SCANNER (THE FIX) ----------------
-elif menu == "Scan QR":
-    st.title("📷 Attendance Scanner")
+# --- TAB 2: THE SCANNER ---
+with tab2:
+    st.title("QR Scanner")
     
-    # Session state to hold the 'found' user so the camera can stop
-    if 'current_student' not in st.session_state:
-        st.session_state.current_student = None
+    # Session state to manage the "detection" flow
+    if 'detected_user' not in st.session_state:
+        st.session_state.detected_user = None
 
-    if st.session_state.current_student is None:
-        run = st.checkbox('Start Camera', value=True)
+    # Step A: Show Camera if no one is detected yet
+    if st.session_state.detected_user is None:
+        cam_toggle = st.checkbox("Turn On Camera", value=True)
         FRAME_WINDOW = st.image([])
-        camera = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(0)
 
-        while run:
-            _, frame = camera.read()
-            if frame is None: break
+        while cam_toggle:
+            ret, frame = cap.read()
+            if not ret: break
             
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Scan for QR
             decoded_objs = decode(frame, symbols=[ZBarSymbol.QRCODE])
-            
             for obj in decoded_objs:
                 raw_data = obj.data.decode("utf-8")
                 try:
                     sid, name, mob = raw_data.split("|")
-                    st.session_state.current_student = {"id": sid, "name": name, "mob": mob}
-                    run = False # Stop the loop
-                except:
-                    st.error("Invalid QR Code Format")
+                    st.session_state.detected_user = {"id": sid, "name": name, "mob": mob}
+                    cam_toggle = False # Break the loop
+                except ValueError:
+                    st.warning("QR Format Invalid. Use: ID|Name|Mobile")
             
-            FRAME_WINDOW.image(frame_rgb)
-        camera.release()
-    
-    # If a student is found, show the data and the "Mark" button
-    if st.session_state.current_student:
-        s = st.session_state.current_student
-        st.subheader("Student Detected")
-        st.info(f"**ID:** {s['id']} | **Name:** {s['name']} | **Mobile:** {s['mob']}")
+            # Display feed
+            if cam_toggle:
+                FRAME_WINDOW.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         
-        col1, col2 = st.columns(2)
-        if col1.button("✅ Confirm Attendance"):
-            save_to_db(s['id'], s['name'], s['mob'], "Present")
-            st.success(f"Saved: {s['name']}")
-            st.session_state.current_student = None # Reset for next scan
-            st.rerun()
-            
-        if col2.button("🔄 Rescan"):
-            st.session_state.current_student = None
+        cap.release()
+
+    # Step B: Show Detection Result and Action Buttons
+    if st.session_state.detected_user:
+        u = st.session_state.detected_user
+        st.info(f"📍 **Detected Student:** {u['name']} (ID: {u['id']})")
+        
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Mark Present", use_container_width=True):
+            conn = sqlite3.connect(DB_NAME)
+            conn.execute("INSERT INTO attendance (student_id, name, mobile, status, scan_time) VALUES (?,?,?,?,?)",
+                         (u['id'], u['name'], u['mob'], "Present", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+            conn.close()
+            st.success(f"Attendance saved for {u['name']}!")
+            st.session_state.detected_user = None # Clear and refresh
             st.rerun()
 
-# ---------------- PAGE 3: VIEW ----------------
-elif menu == "Records":
-    st.title("📋 Attendance Logs")
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql("SELECT * FROM attendance ORDER BY scan_time DESC", conn)
-    conn.close()
-    st.dataframe(df, use_container_width=True)
+        if c2.button("🔄 Clear/Rescan", use_container_width=True):
+            st.session_state.detected_user = None
+            st.rerun()
+
+# --- TAB 3: RECORDS ---
+with tab3:
+    st.title("Attendance Database")
+    if st.button("Refresh Table"):
+        conn = sqlite3.connect(DB_NAME)
+        logs_df = pd.read_sql("SELECT * FROM attendance ORDER BY scan_time DESC", conn)
+        conn.close()
+        st.dataframe(logs_df, use_container_width=True)
